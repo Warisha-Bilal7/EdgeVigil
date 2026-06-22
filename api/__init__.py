@@ -1,0 +1,1 @@
+# SentinelEdge API endpoints

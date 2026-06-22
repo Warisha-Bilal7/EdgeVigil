@@ -1,0 +1,27 @@
+# --- Phase 1: Data foundation (in use now) ---
+numpy>=1.26
+pandas>=2.2
+pytest>=8.0
+
+# --- Phase 2-3: Anomaly core ---
+torch>=2.2
+scikit-learn>=1.4
+
+# --- Phase 4: Quantization ---
+bitsandbytes>=0.43
+
+# --- Phase 5: Diagnostic agent layer ---
+langgraph>=0.1
+langchain-core>=0.2
+faiss-cpu>=1.8
+# Local LLM serving for production (no telemetry leaves the network):
+# install/run Ollama separately — https://ollama.com
+# Groq is fine for early prototyping only; swap LLM_BACKEND before any
+# real deployment, per the "no data leaves network" constraint in the README.
+groq>=0.9
+
+# --- Phase 6: API & dashboard ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy>=2.0
+asyncpg>=0.29
