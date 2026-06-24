@@ -1,171 +1,158 @@
 """
-EdgeVigil — Telemetry Simulator
+EdgeVigil — Failure Injection Framework
 Phase 1: Data Foundation
 
-Generates synthetic multivariate telemetry for heterogeneous device fleets
-(servers, workstations, IoT sensors). Each device type has a distinct
-"normal" baseline distribution — that distinctness is exactly the problem
-the domain-adversarial encoder (Phase 3) has to learn to ignore.
+Injects labeled failure patterns into simulator output so the anomaly core
+(Phase 2/3) has ground truth to train and evaluate against. Three patterns,
+matching the failure modes named in the roadmap:
 
-Output: long-format pandas DataFrame with columns:
-    timestamp, device_id, device_type, cpu, memory, disk_io, network_latency, temperature
+    gradual_drift : metric ramps linearly away from baseline over a window,
+                    then holds at the displaced level
+    sudden_spike  : abrupt, brief deviation, full magnitude immediately
+    slow_leak     : monotonic one-directional creep that does not revert —
+                    once started, stays anomalous for the rest of the series
+                    (models e.g. a memory leak, not a transient excursion)
+
+Each injection writes:
+    - modified telemetry values
+    - a boolean `is_anomaly` column
+    - a `failure_onset` timestamp on the first affected row, used downstream
+      to compute detection lead time (onset vs. the model's first alert time)
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, List, Optional
 
 import numpy as np
 import pandas as pd
 
+FailureKind = Literal["gradual_drift", "sudden_spike", "slow_leak"]
+ALL_METRICS = ["cpu", "memory", "disk_io", "network_latency", "temperature"]
+ALL_KINDS = ["gradual_drift", "sudden_spike", "slow_leak"]
+
 
 @dataclass
-class MetricProfile:
-    """Generative process for one telemetry metric's normal behavior."""
-    mean: float
-    std: float
-    ar_coef: float = 0.6                # AR(1) autocorrelation — telemetry isn't i.i.d. noise
-    diurnal_amplitude: float = 0.0      # 0 = no daily cycle (e.g. server-room temp)
-    diurnal_phase_hours: float = 14.0   # hour of day (0-24) where the cycle peaks
-    min_value: float = 0.0
-    max_value: float = 100.0
+class FailureInjection:
+    device_id: str
+    metric: str
+    kind: FailureKind
+    onset: pd.Timestamp
+    duration_minutes: float
+    magnitude: float  # expressed in units of the metric's own baseline std
 
 
-# Per-device-type baselines. Deliberately distinct distributions per type —
-# pooling these without correction is the failure mode Phase 3's GRL exists to fix.
-DEVICE_PROFILES = {
-    "server": {
-        "cpu": MetricProfile(mean=55, std=6, ar_coef=0.7, diurnal_amplitude=8, diurnal_phase_hours=14),
-        "memory": MetricProfile(mean=65, std=4, ar_coef=0.85, diurnal_amplitude=3, diurnal_phase_hours=14),
-        "disk_io": MetricProfile(mean=30, std=10, ar_coef=0.5, diurnal_amplitude=5, diurnal_phase_hours=2),
-        "network_latency": MetricProfile(mean=4, std=0.8, ar_coef=0.6, diurnal_amplitude=1, diurnal_phase_hours=14, min_value=0.5, max_value=50),
-        "temperature": MetricProfile(mean=42, std=1.5, ar_coef=0.9, diurnal_amplitude=1, diurnal_phase_hours=15, min_value=20, max_value=80),
-    },
-    "workstation": {
-        "cpu": MetricProfile(mean=25, std=15, ar_coef=0.5, diurnal_amplitude=20, diurnal_phase_hours=11),
-        "memory": MetricProfile(mean=45, std=12, ar_coef=0.7, diurnal_amplitude=15, diurnal_phase_hours=11),
-        "disk_io": MetricProfile(mean=10, std=8, ar_coef=0.4, diurnal_amplitude=8, diurnal_phase_hours=11),
-        "network_latency": MetricProfile(mean=12, std=4, ar_coef=0.4, diurnal_amplitude=5, diurnal_phase_hours=11, min_value=1, max_value=200),
-        "temperature": MetricProfile(mean=38, std=3, ar_coef=0.8, diurnal_amplitude=4, diurnal_phase_hours=13, min_value=15, max_value=85),
-    },
-    "iot_sensor": {
-        "cpu": MetricProfile(mean=8, std=3, ar_coef=0.6, diurnal_amplitude=2, diurnal_phase_hours=12),
-        "memory": MetricProfile(mean=20, std=3, ar_coef=0.6, diurnal_amplitude=1, diurnal_phase_hours=12),
-        "disk_io": MetricProfile(mean=2, std=1.5, ar_coef=0.3, diurnal_amplitude=0.5, diurnal_phase_hours=12, max_value=50),
-        # Wireless link -> noisier, higher-variance latency than wired device types.
-        "network_latency": MetricProfile(mean=35, std=15, ar_coef=0.3, diurnal_amplitude=10, diurnal_phase_hours=12, min_value=2, max_value=500),
-        # Ambient-exposed -> wider swing and lower floor than rack-mounted hardware.
-        "temperature": MetricProfile(mean=30, std=5, ar_coef=0.5, diurnal_amplitude=6, diurnal_phase_hours=15, min_value=-10, max_value=70),
-    },
-}
-
-METRICS = ["cpu", "memory", "disk_io", "network_latency", "temperature"]
-
-
-def _generate_series(profile: MetricProfile, n_steps: int, step_minutes: float,
-                      rng: np.random.Generator, start_hour: float = 0.0) -> np.ndarray:
-    """AR(1) process with a diurnal sinusoidal mean, clipped to physical bounds."""
-    hours = (start_hour + np.arange(n_steps) * step_minutes / 60.0) % 24
-    diurnal = profile.diurnal_amplitude * np.cos(2 * np.pi * (hours - profile.diurnal_phase_hours) / 24)
-
-    series = np.empty(n_steps)
-    series[0] = profile.mean + diurnal[0] + rng.normal(0, profile.std)
-    # Scale innovation noise so the AR(1) process has stationary variance == profile.std**2.
-    innovation_std = profile.std * np.sqrt(max(1 - profile.ar_coef ** 2, 1e-6))
-
-    for t in range(1, n_steps):
-        target = profile.mean + diurnal[t]
-        prev_target = profile.mean + diurnal[t - 1]
-        series[t] = target + profile.ar_coef * (series[t - 1] - prev_target) + rng.normal(0, innovation_std)
-
-    return np.clip(series, profile.min_value, profile.max_value)
-
-
-class TelemetrySimulator:
+class FailureInjector:
     """
-    Generates multivariate telemetry for a fleet of simulated devices.
-
-    Usage:
-        sim = TelemetrySimulator(seed=42)
-        df = sim.simulate_fleet(
-            device_counts={"server": 5, "workstation": 10, "iot_sensor": 20},
-            duration_hours=24 * 7,
-            step_minutes=5,
-        )
+    Applies FailureInjection specs onto a telemetry DataFrame produced by
+    TelemetrySimulator. Operates on a copy; never mutates the input in place.
     """
 
-    def __init__(self, seed: Optional[int] = None, profiles: Optional[dict] = None):
+    def __init__(self, seed: Optional[int] = None):
         self.rng = np.random.default_rng(seed)
-        # Copy so held_out_device_type() mutations on one instance don't leak globally.
-        self.profiles = {k: dict(v) for k, v in (profiles or DEVICE_PROFILES).items()}
 
-    def simulate_device(self, device_id: str, device_type: str, duration_hours: float,
-                         step_minutes: float = 5.0,
-                         start_timestamp: Optional[pd.Timestamp] = None) -> pd.DataFrame:
-        if device_type not in self.profiles:
-            raise ValueError(f"Unknown device_type '{device_type}'. Known types: {list(self.profiles.keys())}")
+    def inject(self, df: pd.DataFrame, injections: List[FailureInjection]) -> pd.DataFrame:
+        df = df.copy()
+        if "is_anomaly" not in df.columns:
+            df["is_anomaly"] = False
+        if "failure_onset" not in df.columns:
+            df["failure_onset"] = pd.NaT
 
-        n_steps = int(duration_hours * 60 / step_minutes)
-        start_timestamp = start_timestamp or pd.Timestamp("2026-01-01 00:00:00")
-        start_hour = start_timestamp.hour + start_timestamp.minute / 60.0
+        for spec in injections:
+            df = self._apply_one(df, spec)
+        return df
 
-        timestamps = pd.date_range(start=start_timestamp, periods=n_steps, freq=f"{step_minutes}min")
-        data = {"timestamp": timestamps, "device_id": device_id, "device_type": device_type}
-        for metric in METRICS:
-            profile = self.profiles[device_type][metric]
-            data[metric] = _generate_series(profile, n_steps, step_minutes, self.rng, start_hour=start_hour)
+    def _apply_one(self, df: pd.DataFrame, spec: FailureInjection) -> pd.DataFrame:
+        device_df = df.loc[df["device_id"] == spec.device_id].sort_values("timestamp")
+        if device_df.empty:
+            raise ValueError(f"No rows found for device_id '{spec.device_id}'")
+        if len(device_df) < 2:
+            raise ValueError(f"Device '{spec.device_id}' has fewer than 2 rows; can't infer step size")
 
-        return pd.DataFrame(data)
+        step = device_df["timestamp"].iloc[1] - device_df["timestamp"].iloc[0]
+        baseline_std = device_df[spec.metric].std()
+        if not baseline_std or np.isnan(baseline_std):
+            baseline_std = 1.0
 
-    def simulate_fleet(self, device_counts: dict, duration_hours: float,
-                        step_minutes: float = 5.0,
-                        start_timestamp: Optional[pd.Timestamp] = None) -> pd.DataFrame:
-        frames = []
-        for device_type, count in device_counts.items():
-            for i in range(count):
-                device_id = f"{device_type}-{i:03d}"
-                frames.append(self.simulate_device(
-                    device_id=device_id, device_type=device_type,
-                    duration_hours=duration_hours, step_minutes=step_minutes,
-                    start_timestamp=start_timestamp,
-                ))
-        df = pd.concat(frames, ignore_index=True)
-        return df.sort_values(["device_id", "timestamp"]).reset_index(drop=True)
+        onset_candidates = device_df.index[device_df["timestamp"] >= spec.onset]
+        if len(onset_candidates) == 0:
+            raise ValueError(f"Onset {spec.onset} is after the end of device '{spec.device_id}' telemetry")
+        start = onset_candidates[0]
 
-    def held_out_device_type(self, name: str, base_on: str, perturb: dict) -> None:
-        """
-        Register a new device-type profile by perturbing an existing one.
-        Use this to generate a device type the model never sees during training,
-        for Phase 3's generalization-gap test (F1 with vs. without the GRL).
+        n_window = max(1, int(spec.duration_minutes / (step.total_seconds() / 60)))
+        device_tail = device_df.loc[start:]
+        affected = device_tail.index[:n_window]
+        delta = spec.magnitude * baseline_std
 
-        Example:
-            sim.held_out_device_type(
-                "edge_gateway", base_on="iot_sensor",
-                perturb={"cpu": {"mean": 1.4}, "network_latency": {"mean": 0.7}},
-            )
-        """
-        if base_on not in self.profiles:
-            raise ValueError(f"Unknown base device_type '{base_on}'")
-        new_profile = {}
-        for metric, profile in self.profiles[base_on].items():
-            f = perturb.get(metric, {})
-            new_profile[metric] = MetricProfile(
-                mean=profile.mean * f.get("mean", 1.0),
-                std=profile.std * f.get("std", 1.0),
-                ar_coef=profile.ar_coef,
-                diurnal_amplitude=profile.diurnal_amplitude * f.get("diurnal_amplitude", 1.0),
-                diurnal_phase_hours=profile.diurnal_phase_hours,
-                min_value=profile.min_value,
-                max_value=profile.max_value,
-            )
-        self.profiles[name] = new_profile
+        if spec.kind == "sudden_spike":
+            df.loc[affected, spec.metric] += delta
+            anomalous_rows = affected
+
+        elif spec.kind == "gradual_drift":
+            ramp = np.linspace(0, delta, len(affected))
+            df.loc[affected, spec.metric] += ramp
+            anomalous_rows = affected
+
+        elif spec.kind == "slow_leak":
+            ramp = np.linspace(0, delta, len(affected))
+            df.loc[affected, spec.metric] += ramp
+            remainder = device_tail.index[len(affected):]
+            if len(remainder) > 0:
+                df.loc[remainder, spec.metric] += delta  # holds the leaked value, never reverts
+            anomalous_rows = device_tail.index  # everything from onset to end of series
+
+        else:
+            raise ValueError(f"Unknown failure kind: {spec.kind}")
+
+        df.loc[anomalous_rows, "is_anomaly"] = True
+        if pd.isna(df.loc[start, "failure_onset"]):
+            df.loc[start, "failure_onset"] = spec.onset
+
+        return df
+
+    def random_injection(self, df: pd.DataFrame, device_id: str,
+                          metric: Optional[str] = None, kind: Optional[FailureKind] = None,
+                          min_onset_frac: float = 0.3, max_onset_frac: float = 0.8,
+                          magnitude_range: tuple = (2.5, 6.0)) -> FailureInjection:
+        """Convenience generator for building synthetic eval sets at scale."""
+        device_df = df.loc[df["device_id"] == device_id].sort_values("timestamp")
+        n = len(device_df)
+        metric = metric or self.rng.choice(ALL_METRICS)
+        kind = kind or self.rng.choice(ALL_KINDS)
+        onset_idx = int(self.rng.integers(int(n * min_onset_frac), int(n * max_onset_frac)))
+        onset = device_df["timestamp"].iloc[onset_idx]
+        magnitude = float(self.rng.uniform(*magnitude_range))
+        duration = float(self.rng.choice([15, 30, 60, 120]))
+        return FailureInjection(
+            device_id=device_id, metric=str(metric), kind=str(kind),
+            onset=onset, duration_minutes=duration, magnitude=magnitude,
+        )
+
+    def random_injection_batch(self, df: pd.DataFrame, n_injections: int,
+                                device_ids: Optional[List[str]] = None) -> List[FailureInjection]:
+        """One random injection per randomly chosen device, no device repeated."""
+        pool = device_ids or df["device_id"].unique().tolist()
+        chosen = self.rng.choice(pool, size=min(n_injections, len(pool)), replace=False)
+        return [self.random_injection(df, device_id=str(d)) for d in chosen]
 
 
 if __name__ == "__main__":
-    sim = TelemetrySimulator(seed=42)
-    df = sim.simulate_fleet(
-        device_counts={"server": 3, "workstation": 3, "iot_sensor": 3},
-        duration_hours=24,
-        step_minutes=5,
+    try:
+        from simulate import TelemetrySimulator  # running directly from core/data/
+    except ImportError:
+        from core.data.simulate import TelemetrySimulator  # running as `python -m core.data.inject_failures`
+
+    sim = TelemetrySimulator(seed=1)
+    df = sim.simulate_fleet({"server": 2, "workstation": 2, "iot_sensor": 2}, duration_hours=24)
+
+    injector = FailureInjector(seed=1)
+    spec = FailureInjection(
+        device_id="server-000", metric="cpu", kind="gradual_drift",
+        onset=df["timestamp"].iloc[100], duration_minutes=60, magnitude=4.0,
     )
-    print(df.groupby("device_type")[METRICS].mean().round(2))
-    print(f"\nTotal rows: {len(df)}")
+    labeled = injector.inject(df, [spec])
+    print(labeled.loc[labeled["is_anomaly"], ["timestamp", "device_id", "cpu", "is_anomaly"]].head(10))
+    print(f"\nTotal anomalous rows: {int(labeled['is_anomaly'].sum())}")
+
+    batch = injector.random_injection_batch(df, n_injections=3)
+    for spec in batch:
+        print(spec)

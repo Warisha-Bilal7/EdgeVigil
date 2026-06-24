@@ -136,7 +136,10 @@ class FailureInjector:
 
 
 if __name__ == "__main__":
-    from simulate import TelemetrySimulator
+    try:
+        from simulate import TelemetrySimulator  # running directly from core/data/
+    except ImportError:
+        from core.data.simulate import TelemetrySimulator  # running as `python -m core.data.inject_failures`
 
     sim = TelemetrySimulator(seed=1)
     df = sim.simulate_fleet({"server": 2, "workstation": 2, "iot_sensor": 2}, duration_hours=24)

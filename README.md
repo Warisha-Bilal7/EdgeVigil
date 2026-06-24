@@ -35,7 +35,7 @@ EdgeVigil predicts failures before they happen, entirely on-premise, by learning
 
 ## Why This Is Different
 
-| | Threshold tools (Zabbix, Nagios, Uptime Kuma) | Cloud AIOps (Datadog, Dynatrace) | SentinelEdge |
+| | Threshold tools (Zabbix, Nagios, Uptime Kuma) | Cloud AIOps (Datadog, Dynatrace) | EdgeVigil |
 |---|---|---|---|
 | Data leaves network | No | Yes | No |
 | Adapts per device type | No | Partial | Yes (domain-adversarial) |
@@ -119,30 +119,35 @@ Real labeled enterprise failure data is scarce by nature — that's the whole re
 ```
 edgevigil/
 ├── core/
-│   ├── data/              # telemetry simulators, SMD/NAB loaders
-│   ├── models/             # encoder, GRL, domain classifier, reconstruction head
-│   ├── train.py
-│   ├── quantize.py
-│   └── eval.py
+│   ├── data/
+│   │   ├── simulate.py        # Phase 1 — telemetry simulator (done)
+│   │   ├── inject_failures.py # Phase 1 — failure injection framework (done)
+│   │   └── loaders.py         # Phase 1 — SMD/NAB loaders (done)
+│   ├── models/             # encoder, GRL, domain classifier, reconstruction head — Phase 2/3
+│   ├── train.py             # Phase 2/3 — not yet implemented
+│   ├── quantize.py          # Phase 4 — not yet implemented
+│   └── eval.py               # Phase 2/3 — not yet implemented
 ├── agents/
-│   ├── correlator.py
-│   ├── diagnostician.py
-│   ├── reporter.py
-│   └── graph.py             # LangGraph supervisor/router
+│   ├── correlator.py         # Phase 5 — not yet implemented
+│   ├── diagnostician.py      # Phase 5 — not yet implemented
+│   ├── reporter.py           # Phase 5 — not yet implemented
+│   └── graph.py               # Phase 5 — LangGraph supervisor/router, not yet implemented
 ├── api/
-│   ├── main.py              # FastAPI app
+│   ├── main.py                # Phase 6 — not yet implemented
 │   └── ingestion.py
-├── dashboard/
-├── runbooks/                 # local knowledge base for RAG
+├── dashboard/                  # Phase 6
+├── runbooks/                    # local knowledge base for RAG — Phase 5
 ├── tests/
+│   └── test_phase1.py          # 13 tests, passing
 ├── .env.example
+├── requirements.txt
 └── README.md
 ```
 
 ## Build Roadmap
 
-**Phase 1 — Data foundation**
-Telemetry simulator for 3 device types (server, workstation, IoT sensor), failure injection framework, SMD/NAB loaders.
+**Phase 1 — Data foundation ✅ done**
+Telemetry simulator for 3 device types (server, workstation, IoT sensor), failure injection framework (gradual drift, sudden spike, slow leak), SMD/NAB loaders. 13 unit tests passing.
 
 **Phase 2 — Baseline anomaly model**
 Per-device-type LSTM-autoencoder, no domain adaptation yet. Establish baseline F1/FPR — this is the number everything else needs to beat.
@@ -162,19 +167,25 @@ FastAPI ingestion + alerting endpoints, minimal dashboard for live status and in
 ## Getting Started
 
 ```bash
-git clone https://github.com/yourusername/sentineledge.git
-cd sentineledge
+git clone https://github.com/yourusername/edgevigil.git
+cd edgevigil
 python -m venv venv
 source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -r requirements.txt --break-system-packages
 cp .env.example .env
 ```
 
-Run the telemetry simulator and start training the Phase 2 baseline:
+Run the telemetry simulator and failure injector:
 
 ```bash
 python core/data/simulate.py
-python core/train.py --phase baseline
+python core/data/inject_failures.py
+```
+
+Run the Phase 1 test suite:
+
+```bash
+python -m unittest tests.test_phase1 -v
 ```
 
 ## Configuration
@@ -186,7 +197,9 @@ python core/train.py --phase baseline
 
 ## Status
 
-Phase 1 in progress. This README defines the target architecture; implementation details may shift as the domain-adversarial training results come in.
+Phase 1 (data foundation) complete — telemetry simulator, failure injection framework, and SMD/NAB loaders all implemented and tested (13 tests passing).
+
+Phase 2 (baseline anomaly model) implemented — per-device-type LSTM-autoencoder, sliding-window construction, train/eval scripts with a leakage-free threshold (set from a held-out normal validation split, not from test data) and a Nagios-style static baseline compared across all 5 metrics at window-level granularity. 23 of 26 Phase 1+2 tests pass in this dev environment; the 3 skipped are the model's forward-pass/training-loop tests, which require `torch` — **run `python -m unittest tests.test_phase2 -v` locally to confirm those pass** before trusting the F1/FPR numbers `eval.py` reports.
 
 ## License
 
