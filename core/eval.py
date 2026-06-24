@@ -1,183 +1,158 @@
 """
-EdgeVigil — Phase 2: Evaluation harness
-Loads a trained per-device-type LSTM-autoencoder, scores a held-out test
-fleet with injected failures, and reports:
+EdgeVigil — Failure Injection Framework
+Phase 1: Data Foundation
 
-    - F1 / precision / recall on injected failure detection
-    - False positive rate, model vs. a Nagios-style static threshold baseline
-      (this comparison is the headline number per the README)
-    - Mean detection lag: minutes between failure onset and the model's
-      first alert on that device
+Injects labeled failure patterns into simulator output so the anomaly core
+(Phase 2/3) has ground truth to train and evaluate against. Three patterns,
+matching the failure modes named in the roadmap:
 
-A note on "detection lag" vs. the README's "lead time": lead time implies
-catching a failure *before* it fully manifests. For gradual_drift and
-slow_leak injections, the model can flag a window mid-ramp, before the
-failure reaches full magnitude — that's genuine early warning. For
-sudden_spike, there's no ramp to catch early, so "lag" is the honest framing
-there. This script reports lag for all kinds and lets you slice by failure
-kind if you want the lead-time framing only where it's earned.
+    gradual_drift : metric ramps linearly away from baseline over a window,
+                    then holds at the displaced level
+    sudden_spike  : abrupt, brief deviation, full magnitude immediately
+    slow_leak     : monotonic one-directional creep that does not revert —
+                    once started, stays anomalous for the rest of the series
+                    (models e.g. a memory leak, not a transient excursion)
 
-Usage:
-    python core/eval.py --device-type server
-    python core/eval.py --device-type all
+Each injection writes:
+    - modified telemetry values
+    - a boolean `is_anomaly` column
+    - a `failure_onset` timestamp on the first affected row, used downstream
+      to compute detection lead time (onset vs. the model's first alert time)
 """
 
-import argparse
-import json
-import sys
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Literal, List, Optional
 
 import numpy as np
-import torch
-from sklearn.metrics import f1_score, precision_score, recall_score
+import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "data"))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "models"))
-
-from simulate import TelemetrySimulator                     # noqa: E402
-from inject_failures import FailureInjector                 # noqa: E402
-from windowing import make_windows, Standardizer             # noqa: E402
-from lstm_autoencoder import LSTMAutoencoder                 # noqa: E402
+FailureKind = Literal["gradual_drift", "sudden_spike", "slow_leak"]
+ALL_METRICS = ["cpu", "memory", "disk_io", "network_latency", "temperature"]
+ALL_KINDS = ["gradual_drift", "sudden_spike", "slow_leak"]
 
 
-def build_test_fleet(device_type: str, n_devices: int = 5, duration_hours: float = 24 * 3,
-                      step_minutes: float = 5.0, n_failures: int = 5, seed: int = 99):
-    sim = TelemetrySimulator(seed=seed)
-    df = sim.simulate_fleet({device_type: n_devices}, duration_hours=duration_hours, step_minutes=step_minutes)
-    injector = FailureInjector(seed=seed)
-    batch = injector.random_injection_batch(df, n_injections=min(n_failures, n_devices))
-    return injector.inject(df, batch), batch
+@dataclass
+class FailureInjection:
+    device_id: str
+    metric: str
+    kind: FailureKind
+    onset: pd.Timestamp
+    duration_minutes: float
+    magnitude: float  # expressed in units of the metric's own baseline std
 
 
-def load_model(model_path: Path):
-    ckpt = torch.load(model_path, map_location="cpu")
-    model = LSTMAutoencoder(n_features=ckpt["n_features"], window_size=ckpt["window_size"],
-                             hidden_size=ckpt["hidden_size"], latent_dim=ckpt["latent_dim"])
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-    return model, ckpt["window_size"]
-
-
-def score_windows(model, scaler, X: np.ndarray) -> np.ndarray:
-    X_norm = scaler.transform(X).astype(np.float32)
-    with torch.no_grad():
-        return model.reconstruction_error(torch.from_numpy(X_norm)).numpy()
-
-
-def static_threshold_baseline_windows(df, feature_thresholds: dict, window_size: int, step: int = 1) -> np.ndarray:
+class FailureInjector:
     """
-    Nagios-style baseline, properly comparable to the model: flags a WINDOW
-    (not a single row) if ANY of the 5 metrics exceeds its own fixed
-    threshold at ANY point in that window. Mirrors make_windows()'s exact
-    groupby/sort/skip-short-device logic so the output aligns 1:1 with
-    make_windows()'s y_true when called on the same df/window_size/step.
+    Applies FailureInjection specs onto a telemetry DataFrame produced by
+    TelemetrySimulator. Operates on a copy; never mutates the input in place.
     """
-    row_flag = np.zeros(len(df), dtype=bool)
-    for feature, threshold in feature_thresholds.items():
-        row_flag |= (df[feature].to_numpy() > threshold)
 
-    df = df.copy()
-    df["_flag"] = row_flag
+    def __init__(self, seed: Optional[int] = None):
+        self.rng = np.random.default_rng(seed)
 
-    window_flags = []
-    for _, group in df.groupby("device_id", sort=False):
-        group = group.sort_values("timestamp").reset_index(drop=True)
-        n = len(group)
-        if n < window_size:
-            continue
-        flags = group["_flag"].to_numpy()
-        for start in range(0, n - window_size + 1, step):
-            window_flags.append(bool(flags[start:start + window_size].any()))
-    return np.array(window_flags, dtype=bool)
+    def inject(self, df: pd.DataFrame, injections: List[FailureInjection]) -> pd.DataFrame:
+        df = df.copy()
+        if "is_anomaly" not in df.columns:
+            df["is_anomaly"] = False
+        if "failure_onset" not in df.columns:
+            df["failure_onset"] = pd.NaT
 
+        for spec in injections:
+            df = self._apply_one(df, spec)
+        return df
 
-def evaluate(device_type: str, model_dir: str = "artifacts", percentile: float = None, seed: int = 99) -> dict:
-    model_path = Path(model_dir) / f"lstm_ae_{device_type}.pt"
-    scaler_path = Path(model_dir) / f"scaler_{device_type}.json"
-    thresholds_path = Path(model_dir) / f"thresholds_{device_type}.json"
-    if not model_path.exists():
-        raise FileNotFoundError(f"No trained model at {model_path} — run train.py first")
-    if not thresholds_path.exists():
-        raise FileNotFoundError(
-            f"No thresholds file at {thresholds_path} — retrain with the current train.py "
-            f"(older checkpoints predate threshold persistence)"
+    def _apply_one(self, df: pd.DataFrame, spec: FailureInjection) -> pd.DataFrame:
+        device_df = df.loc[df["device_id"] == spec.device_id].sort_values("timestamp")
+        if device_df.empty:
+            raise ValueError(f"No rows found for device_id '{spec.device_id}'")
+        if len(device_df) < 2:
+            raise ValueError(f"Device '{spec.device_id}' has fewer than 2 rows; can't infer step size")
+
+        step = device_df["timestamp"].iloc[1] - device_df["timestamp"].iloc[0]
+        baseline_std = device_df[spec.metric].std()
+        if not baseline_std or np.isnan(baseline_std):
+            baseline_std = 1.0
+
+        onset_candidates = device_df.index[device_df["timestamp"] >= spec.onset]
+        if len(onset_candidates) == 0:
+            raise ValueError(f"Onset {spec.onset} is after the end of device '{spec.device_id}' telemetry")
+        start = onset_candidates[0]
+
+        n_window = max(1, int(spec.duration_minutes / (step.total_seconds() / 60)))
+        device_tail = device_df.loc[start:]
+        affected = device_tail.index[:n_window]
+        delta = spec.magnitude * baseline_std
+
+        if spec.kind == "sudden_spike":
+            df.loc[affected, spec.metric] += delta
+            anomalous_rows = affected
+
+        elif spec.kind == "gradual_drift":
+            ramp = np.linspace(0, delta, len(affected))
+            df.loc[affected, spec.metric] += ramp
+            anomalous_rows = affected
+
+        elif spec.kind == "slow_leak":
+            ramp = np.linspace(0, delta, len(affected))
+            df.loc[affected, spec.metric] += ramp
+            remainder = device_tail.index[len(affected):]
+            if len(remainder) > 0:
+                df.loc[remainder, spec.metric] += delta  # holds the leaked value, never reverts
+            anomalous_rows = device_tail.index  # everything from onset to end of series
+
+        else:
+            raise ValueError(f"Unknown failure kind: {spec.kind}")
+
+        df.loc[anomalous_rows, "is_anomaly"] = True
+        if pd.isna(df.loc[start, "failure_onset"]):
+            df.loc[start, "failure_onset"] = spec.onset
+
+        return df
+
+    def random_injection(self, df: pd.DataFrame, device_id: str,
+                          metric: Optional[str] = None, kind: Optional[FailureKind] = None,
+                          min_onset_frac: float = 0.3, max_onset_frac: float = 0.8,
+                          magnitude_range: tuple = (2.5, 6.0)) -> FailureInjection:
+        """Convenience generator for building synthetic eval sets at scale."""
+        device_df = df.loc[df["device_id"] == device_id].sort_values("timestamp")
+        n = len(device_df)
+        metric = metric or self.rng.choice(ALL_METRICS)
+        kind = kind or self.rng.choice(ALL_KINDS)
+        onset_idx = int(self.rng.integers(int(n * min_onset_frac), int(n * max_onset_frac)))
+        onset = device_df["timestamp"].iloc[onset_idx]
+        magnitude = float(self.rng.uniform(*magnitude_range))
+        duration = float(self.rng.choice([15, 30, 60, 120]))
+        return FailureInjection(
+            device_id=device_id, metric=str(metric), kind=str(kind),
+            onset=onset, duration_minutes=duration, magnitude=magnitude,
         )
 
-    model, window_size = load_model(model_path)
-    scaler = Standardizer.from_dict(json.loads(scaler_path.read_text()))
-    threshold_data = json.loads(thresholds_path.read_text())
-
-    # Threshold comes from the held-out NORMAL validation split fit during
-    # training — never recomputed from this test set's own error
-    # distribution, since that set contains the failures being evaluated.
-    # --percentile lets you explore a different operating point on the same
-    # persisted validation errors without retraining.
-    if percentile is not None:
-        threshold = float(np.percentile(threshold_data["val_errors"], percentile))
-    else:
-        threshold = threshold_data["reconstruction_threshold"]
-
-    df, injections = build_test_fleet(device_type, seed=seed)
-    X, y_true, end_ts, device_ids, _ = make_windows(df, window_size=window_size, step=1)
-    if len(X) == 0:
-        raise RuntimeError("No windows produced — check window_size against series length")
-
-    errors = score_windows(model, scaler, X)
-    y_pred = errors > threshold
-
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    fpr = (y_pred & ~y_true).sum() / max((~y_true).sum(), 1)
-
-    static_pred = static_threshold_baseline_windows(
-        df, threshold_data["static_feature_thresholds"], window_size=window_size, step=1
-    )
-    static_f1 = f1_score(y_true, static_pred, zero_division=0)
-    static_precision = precision_score(y_true, static_pred, zero_division=0)
-    static_recall = recall_score(y_true, static_pred, zero_division=0)
-    static_fpr = (static_pred & ~y_true).sum() / max((~y_true).sum(), 1)
-
-    lag_minutes = []
-    for spec in injections:
-        dev_mask = device_ids == spec.device_id
-        alerts = end_ts[dev_mask & y_pred]
-        alerts_after_onset = alerts[alerts >= np.datetime64(spec.onset)]
-        if len(alerts_after_onset) > 0:
-            first_alert = alerts_after_onset.min()
-            lag_minutes.append((first_alert - np.datetime64(spec.onset)) / np.timedelta64(1, "m"))
-
-    return {
-        "device_type": device_type,
-        "n_windows": int(len(X)),
-        "n_injections": len(injections),
-        "n_injections_detected": len(lag_minutes),
-        "threshold": round(float(threshold), 5),
-        "f1": round(float(f1), 4),
-        "precision": round(float(precision), 4),
-        "recall": round(float(recall), 4),
-        "model_fpr": round(float(fpr), 4),
-        "static_baseline_f1": round(float(static_f1), 4),
-        "static_baseline_precision": round(float(static_precision), 4),
-        "static_baseline_recall": round(float(static_recall), 4),
-        "static_baseline_fpr": round(float(static_fpr), 4),
-        "mean_detection_lag_minutes": round(float(np.mean(lag_minutes)), 2) if lag_minutes else None,
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Phase 2: evaluate trained baseline against injected failures")
-    parser.add_argument("--device-type", choices=["server", "workstation", "iot_sensor", "all"], default="all")
-    parser.add_argument("--model-dir", default="artifacts")
-    parser.add_argument("--percentile", type=float, default=None,
-                         help="Override the persisted threshold by re-deriving it at this percentile "
-                              "of the training run's held-out validation errors (no retrain needed).")
-    args = parser.parse_args()
-
-    targets = ["server", "workstation", "iot_sensor"] if args.device_type == "all" else [args.device_type]
-    for dt in targets:
-        print(json.dumps(evaluate(dt, model_dir=args.model_dir, percentile=args.percentile), indent=2))
+    def random_injection_batch(self, df: pd.DataFrame, n_injections: int,
+                                device_ids: Optional[List[str]] = None) -> List[FailureInjection]:
+        """One random injection per randomly chosen device, no device repeated."""
+        pool = device_ids or df["device_id"].unique().tolist()
+        chosen = self.rng.choice(pool, size=min(n_injections, len(pool)), replace=False)
+        return [self.random_injection(df, device_id=str(d)) for d in chosen]
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        from simulate import TelemetrySimulator  # running directly from core/data/
+    except ImportError:
+        from core.data.simulate import TelemetrySimulator  # running as `python -m core.data.inject_failures`
+
+    sim = TelemetrySimulator(seed=1)
+    df = sim.simulate_fleet({"server": 2, "workstation": 2, "iot_sensor": 2}, duration_hours=24)
+
+    injector = FailureInjector(seed=1)
+    spec = FailureInjection(
+        device_id="server-000", metric="cpu", kind="gradual_drift",
+        onset=df["timestamp"].iloc[100], duration_minutes=60, magnitude=4.0,
+    )
+    labeled = injector.inject(df, [spec])
+    print(labeled.loc[labeled["is_anomaly"], ["timestamp", "device_id", "cpu", "is_anomaly"]].head(10))
+    print(f"\nTotal anomalous rows: {int(labeled['is_anomaly'].sum())}")
+
+    batch = injector.random_injection_batch(df, n_injections=3)
+    for spec in batch:
+        print(spec)
