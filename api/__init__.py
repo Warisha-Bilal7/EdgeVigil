@@ -1,1 +1,1 @@
-# SentinelEdge API endpoints
+"""Not yet implemented."""
