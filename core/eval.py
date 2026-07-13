@@ -134,11 +134,16 @@ def evaluate(device_type: str, model_dir: str = "artifacts",
     errors = score_windows(model, scaler, X, score_mode=score_mode)
     y_pred = errors > threshold
 
-    # Per-injection detection lag
+    # Per-injection detection lag.
+    # Only windows whose end_ts >= spec.onset are candidates — an alert
+    # before the failure starts is a false positive, not early detection.
     lag_minutes = []
+    missed = []
     for spec in injections:
-        mask = (device_ids == spec.device_id) & y_pred
+        after_onset = end_ts >= np.datetime64(spec.onset)
+        mask = (device_ids == spec.device_id) & y_pred & after_onset
         if not mask.any():
+            missed.append(spec.device_id)
             continue
         first_alert = end_ts[mask].min()
         lag = (first_alert - np.datetime64(spec.onset)) / np.timedelta64(1, "m")
@@ -162,6 +167,7 @@ def evaluate(device_type: str, model_dir: str = "artifacts",
         "n_windows":                    int(len(X)),
         "n_injections":                 len(injections),
         "n_injections_detected":        len(lag_minutes),
+        "n_injections_missed":          len(missed),
         "threshold":                    round(float(threshold), 5),
         "f1":                           round(float(f1), 4),
         "precision":                    round(float(precision), 4),
@@ -172,6 +178,7 @@ def evaluate(device_type: str, model_dir: str = "artifacts",
         "static_baseline_recall":       round(float(static_recall), 4),
         "static_baseline_fpr":          round(float(static_fpr), 4),
         "mean_detection_lag_minutes":   round(float(np.mean(lag_minutes)), 2) if lag_minutes else None,
+        "detection_lags_minutes":       [round(l, 2) for l in lag_minutes],
     }
 
 

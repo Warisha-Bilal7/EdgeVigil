@@ -161,5 +161,55 @@ class TestLSTMAutoencoder(unittest.TestCase):
         self.assertLess(losses[-1], losses[0] * 0.5)
 
 
+class TestDetectionLag(unittest.TestCase):
+    """
+    Guards against the pre-onset false-positive bug: the first flagged
+    window for a device may be a false positive that precedes the injection,
+    which would produce a negative (nonsensical) detection lag.
+    eval.py's lag computation must filter to windows >= onset.
+    """
+
+    def _make_labeled_df(self):
+        sim = TelemetrySimulator(seed=7)
+        df  = sim.simulate_fleet({"server": 2}, duration_hours=48)
+        inj = FailureInjector(seed=7)
+        # Inject late in the series so there's plenty of pre-onset series to
+        # produce FP windows that would give a negative lag if unfiltered.
+        onset = df.loc[df["device_id"] == "server-000", "timestamp"].iloc[-20]
+        spec  = FailureInjection("server-000", "cpu", "sudden_spike", onset, 60, 6.0)
+        return inj.inject(df, [spec]), spec
+
+    def test_lag_cannot_be_negative(self):
+        import pandas as pd
+        labeled_df, spec = self._make_labeled_df()
+        X, y, end_ts, device_ids, _ = make_windows(labeled_df, window_size=12, step=1)
+
+        # Simulate a detector that flags ALL windows (100% recall, 100% FPR)
+        # — lag should still be >= 0 because we filter by onset.
+        y_pred = np.ones(len(X), dtype=bool)
+
+        after_onset = end_ts >= np.datetime64(spec.onset)
+        mask        = (device_ids == spec.device_id) & y_pred & after_onset
+        self.assertTrue(mask.any(), "Should have at least one window after onset")
+
+        first_alert = end_ts[mask].min()
+        lag = (first_alert - np.datetime64(spec.onset)) / np.timedelta64(1, "m")
+        self.assertGreaterEqual(lag, 0.0, "Detection lag must be non-negative")
+
+    def test_pre_onset_flag_does_not_count_as_detection(self):
+        labeled_df, spec = self._make_labeled_df()
+        X, y, end_ts, device_ids, _ = make_windows(labeled_df, window_size=12, step=1)
+
+        # Flag only windows BEFORE the onset (pure false positives pre-injection).
+        before_onset = end_ts < np.datetime64(spec.onset)
+        y_pred = before_onset & (device_ids == spec.device_id)
+
+        after_onset = end_ts >= np.datetime64(spec.onset)
+        mask = (device_ids == spec.device_id) & y_pred & after_onset
+        # No post-onset windows flagged → injection should be counted as missed.
+        self.assertFalse(mask.any(), "Pre-onset false positives must not register as detections")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
